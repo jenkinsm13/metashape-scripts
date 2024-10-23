@@ -1,0 +1,109 @@
+import os
+import Metashape
+import time
+
+process_network = False
+
+# Prompt the user to select a Watch Folder
+watch_folder = Metashape.app.getExistingDirectory("Select Watch Folder")
+processed_photos = set()
+
+# Set the batch size
+batch_size = 4000
+
+# Create a new chunk
+doc = Metashape.app.document
+chunk = doc.addChunk()
+
+while True:
+    # Check the watch folder for JPEG images
+    new_images = []
+    for root, dirs, files in os.walk(watch_folder):
+        for filename in files:
+            if filename.endswith(".jpg"):
+                image_path = os.path.join(root, filename)
+                if os.path.getsize(image_path) > 1000 and image_path not in processed_photos:
+                    new_images.append(image_path)
+
+    # If images exist, import images over 1 MB to the active chunk and start network processing
+    if new_images:
+        # Divide new_images into batches
+        batches = [new_images[i:i+batch_size] for i in range(0, len(new_images), batch_size)]
+
+        for batch in batches:
+
+            try:
+                chunk.addPhotos(batch)
+            except OSError:
+                for image_path in batch:
+                    try:
+                        chunk.addPhotos([image_path])
+                    except OSError:
+                        print(f"Could not add photo: {image_path}")
+                        continue
+
+            processed_photos.update(batch)
+
+            # Save project
+            doc.save()
+
+            # Align photos using network processing
+            tasks = []
+
+            # Match photos task
+            task = Metashape.Tasks.MatchPhotos()
+            task.downscale = 1
+            task.keypoint_limit = 40000
+            task.tiepoint_limit = 4000
+            task.generic_preselection = True
+            task.reference_preselection = True
+            task.keep_keypoints = True
+            tasks.append(task)
+
+            # Align cameras task
+            task = Metashape.Tasks.AlignCameras()
+            adaptive_fitting = True
+            tasks.append(task)
+
+            if process_network:
+                network_tasks = []
+                for task in tasks:
+                    if task.target == Metashape.Tasks.DocumentTarget:
+                        network_tasks.append(task.toNetworkTask(doc))
+                    else:
+                        network_tasks.append(task.toNetworkTask(chunk))
+
+                client = Metashape.NetworkClient()
+                client.connect("172.31.84.88")
+                batch_id = client.createBatch(doc.path, network_tasks)
+                client.setBatchPaused(batch_id, False)
+                status = client.batchStatus(batch_id)
+                print("Processing started")
+                print(status)
+            else:
+                for task in tasks:
+                    if task.target == Metashape.Tasks.DocumentTarget:
+                        task.apply(doc)
+                    else:
+                        task.apply(chunk)
+
+                print("Processing finished")
+
+            # Wait for batch processing to complete
+            if process_network:
+                while True:
+                    status = client.batchStatus(batch_id)
+                    if 'status' in status and status['status'] == 'completed':
+                        break
+                    time.sleep(10)
+
+                # Reopen the project in Metashape
+                time.sleep(20)
+                doc.open(doc.path)
+
+        # Check the watch folder again for new images
+        continue
+
+    # If images were not imported, end the script
+    break
+
