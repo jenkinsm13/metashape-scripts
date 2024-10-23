@@ -1,0 +1,125 @@
+import os
+import Metashape
+import time
+
+process_network = False
+
+# Prompt the user to select a Watch Folder
+watch_folder = Metashape.app.getExistingDirectory("Select Watch Folder")
+processed_photos = set()
+
+# Set the batch size
+batch_size = 4000
+
+# Create a new chunk
+doc = Metashape.app.document
+chunk = doc.addChunk()
+
+while True:
+    # Check the watch folder for JPEG images
+    new_images = []
+    for root, dirs, files in os.walk(watch_folder):
+        for filename in files:
+            if filename.endswith(".jpg"):
+                image_path = os.path.join(root, filename)
+                if os.path.getsize(image_path) > 1000 and image_path not in processed_photos:
+                    new_images.append(image_path)
+
+    # If images exist, import images over 1 MB to the active chunk and start processing
+    if new_images:
+        # Divide new_images into batches
+        batches = [new_images[i:i+batch_size] for i in range(0, len(new_images), batch_size)]
+
+        for batch in batches:
+
+            try:
+                chunk.addPhotos(batch)
+            except OSError:
+                for image_path in batch:
+                    try:
+                        chunk.addPhotos([image_path])
+                    except OSError:
+                        print(f"Could not add photo: {image_path}")
+                        continue
+
+            processed_photos.update(batch)
+
+            # Save project
+            doc.save()
+
+            # Align photos using network processing
+            tasks = []
+
+            # Match photos task
+            match_task = Metashape.Tasks.MatchPhotos()
+            match_task.downscale = 1
+            match_task.keypoint_limit = 40000
+            match_task.tiepoint_limit = 4000
+            match_task.generic_preselection = True
+            match_task.reference_preselection = True
+            match_task.keep_keypoints = True
+
+            # Align cameras task
+            align_task = Metashape.Tasks.AlignCameras()
+            align_task.adaptive_fitting = True
+
+            tasks.append(match_task)
+            tasks.append(align_task)
+
+            if process_network:
+                network_tasks = []
+                for task in tasks:
+                    if task.target == Metashape.Tasks.DocumentTarget:
+                        network_tasks.append(task.toNetworkTask(doc))
+                    else:
+                        network_tasks.append(task.toNetworkTask(chunk))
+
+                client = Metashape.NetworkClient()
+                client.connect("172.31.84.88")
+                batch_id = client.createBatch(doc.path, network_tasks)
+                client.setBatchPaused(batch_id, False)
+                print("Processing started")
+
+                # Wait for batch processing to complete
+                while True:
+                    status = client.batchStatus(batch_id)
+                    if 'status' in status and status['status'] == 'completed':
+                        break
+                    time.sleep(10)
+                    Metashape.app.update()  # Keep GUI responsive
+
+                # Reopen the project in Metashape
+                time.sleep(20)
+                doc.open(doc.path)
+
+            else:
+                # Run tasks asynchronously to keep GUI responsive
+                for task in tasks:
+                    if task.target == Metashape.Tasks.DocumentTarget:
+                        task.applyAsync(doc)
+                    else:
+                        task.applyAsync(chunk)
+
+                print("Processing started")
+
+                # Wait for tasks to complete
+                task_finished = False
+                while not task_finished:
+                    task_finished = all([task.completed for task in chunk.tasks])
+                    time.sleep(1)
+                    Metashape.app.update()  # Keep GUI responsive
+
+                print("Processing finished")
+
+            # Allow GUI updates
+            Metashape.app.update()
+
+        # Continue checking the watch folder for new images
+        time.sleep(5)  # Wait a bit before checking again
+        continue
+
+    else:
+        # No new images found; wait before checking again
+        time.sleep(5)
+        Metashape.app.update()
+        continue
